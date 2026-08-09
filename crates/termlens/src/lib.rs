@@ -1,0 +1,95 @@
+//! Headless PTY test harness for CLI/TUI applications.
+//!
+//! `termlens` spawns your program in a **real pseudo-terminal**, feeds its
+//! output through a **VT emulator** into an in-memory **screen grid**, and
+//! lets tests **assert and snapshot on the rendered screen** instead of raw
+//! bytes — Playwright for the terminal.
+//!
+//! - It is *not* an expect-style stream matcher (see `rexpect`/`expectrl`).
+//! - It is *not* an SVG transcript generator for docs (see `term-transcript`).
+//! - It *is*: real PTY + emulated screen + snapshot assertions.
+//!
+//! # Example
+//!
+//! ```
+//! use std::time::Duration;
+//! use termlens::{Key, Terminal};
+//!
+//! # fn main() -> termlens::Result<()> {
+//! let mut t = Terminal::builder()
+//!     .size(80, 24)
+//!     .env("TERM", "xterm-256color") // the default; shown for completeness
+//!     .timeout(Duration::from_secs(10))
+//!     .args(["-c", r#"read line; echo "got: $line"; read quit"#])
+//!     .spawn("sh")?;
+//!
+//! t.send_str("hello");
+//! t.send(Key::Enter);
+//! t.wait_until(|screen| screen.contains("got: hello"))?;
+//!
+//! t.send(Key::Enter); // release `read quit`; the script finishes
+//! let status = t.wait_exit()?;
+//! assert!(status.success());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Every `wait_*` call runs under a deadline (builder
+//! [`timeout`](TerminalBuilder::timeout), default 5s), and a timeout error
+//! [embeds the screen](Error::Timeout) so a CI log alone shows what the
+//! application was displaying. A background reader thread drains the PTY
+//! continuously — no output is lost between waits.
+//!
+//! With the default `insta` feature, snapshot-test whole screens:
+//!
+//! ```no_run
+//! # fn main() -> termlens::Result<()> {
+//! # let mut t = termlens::Terminal::builder().spawn("true")?;
+//! insta::assert_snapshot!(t.screen());        // plain insta…
+//! termlens::assert_screen_snapshot!(t.screen()); // …or the bundled macro
+//! # Ok(())
+//! # }
+//! ```
+
+#![warn(missing_docs)]
+
+mod emu;
+mod error;
+mod keys;
+mod screen;
+mod terminal;
+mod wait;
+
+pub use error::{Error, Result};
+pub use keys::Key;
+pub use screen::{Cell, Color, Screen, Style};
+pub use terminal::{ExitStatus, Terminal, TerminalBuilder};
+
+/// Re-export of [`insta`](https://insta.rs) (feature `insta`, on by
+/// default), so [`assert_screen_snapshot!`] always agrees with the `insta`
+/// version doing the snapshotting.
+#[cfg(feature = "insta")]
+pub use insta;
+
+/// Snapshot-assert anything that displays like a [`Screen`].
+///
+/// Sugar for [`insta::assert_snapshot!`] through the re-exported `insta`;
+/// accepts the same optional inline-snapshot form:
+///
+/// ```no_run
+/// # fn main() -> termlens::Result<()> {
+/// # let t = termlens::Terminal::builder().spawn("true")?;
+/// termlens::assert_screen_snapshot!(t.screen());
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "insta")]
+#[macro_export]
+macro_rules! assert_screen_snapshot {
+    ($screen:expr) => {
+        $crate::insta::assert_snapshot!($screen)
+    };
+    ($screen:expr, @$inline:literal) => {
+        $crate::insta::assert_snapshot!($screen, @$inline)
+    };
+}
