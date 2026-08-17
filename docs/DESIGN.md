@@ -11,7 +11,7 @@ flowchart TB
   test["test code"]
   l4["4 · assertions<br/>wait_until / wait_frame / wait_idle / wait_exit · Screen queries · insta snapshots"]
   l3["3 · Screen<br/>immutable Arc-backed grid snapshots · Cell · Style · cursor · title & modes — termlens's own types"]
-  l2["2 · emulator<br/>internal trait: process · snapshot · mid_sequence · in_sync_update · input_modes · set_size<br/>backend: vt100"]
+  l2["2 · emulator<br/>internal trait: process · snapshot · mid_sequence · in_sync_update · input_modes · mode_state · set_size<br/>backend: vt100"]
   l1["1 · PTY<br/>portable-pty · reader thread · resize TIOCSWINSZ → SIGWINCH · lifecycle lock"]
   app["child app<br/>spawned in the PTY, unmodified"]
 
@@ -20,7 +20,7 @@ flowchart TB
   l2 -->|"snapshot on demand"| l3
   l3 -->|"predicates · dumps embedded in every timeout"| l4
   l4 --> test
-  test -.->|"send · click · paste · resize · signal"| l1
+  test -.->|"send · click · drag · paste · resize · signal"| l1
   l1 -.->|"stdin bytes · SIGWINCH"| app
   classDef ours fill:#2563eb,color:#ffffff,stroke:#1d4ed8,stroke-width:1px;
   class l1,l2,l3,l4 ours
@@ -52,20 +52,37 @@ emulator cannot render, and kitty's `CSI ? u` probe is deliberately left
 unanswered because its protocol resolves via the DA1 reply, exactly as
 on a real non-kitty terminal.
 
+`DECRQM` ("is private mode *n* set?") is answered too, and answering it
+is what lets an application that *probes* before using synchronized
+output turn it on against termlens — so `wait_frame` can work against a
+program nobody modified for us. Every reply is truthful or absent:
+modes whose state the emulator holds exactly report set/reset, and
+anything else — including the mouse tracking modes, which the backend
+collapses into one mutually exclusive value — reports "not recognized"
+rather than a guess.
+
 Precision: the emulator stops consuming at each query byte (the same
 mechanism as frame boundaries), so a cursor-position report reflects the
 cursor *at the query*, not after later output in the same chunk moved
 it. Replies are built under the state lock but written after it is
 released — the state lock and the writer lock are never held together.
 
-**The drain never writes.** Replies are handed to a dedicated responder
-thread over a bounded queue. Writing them from the reader thread would
-block whenever the application stopped reading its input; the drain
-would stop, the child would then block writing into a full output
-buffer, and the harness would deadlock itself with no test input
-involved. A full queue means the application is not reading at all — so
-it cannot be waiting on those bytes — and the replies are counted and
-named in the next wait's error instead.
+**Nothing writes to the child on a thread that cannot afford to wait.**
+Every write — query replies and typed input alike — is handed to a
+dedicated writer thread over a bounded queue. Typed input carries an
+acknowledgement channel, so the test thread applies the terminal's
+deadline and panics with the screen ("the application is not reading its
+input") instead of blocking forever; there is no portable way to ask
+whether a PTY write *would* block, since `POLLOUT` on a macOS master
+reports writable and then blocks anyway.
+
+Replies go to that same thread, fire-and-forget: writing them from the
+reader thread would block whenever the application stopped reading its
+input; the drain would stop, the child would then block writing into a
+full output buffer, and the harness would deadlock itself with no test
+input involved. A full queue means the application is not reading at
+all — so it cannot be waiting on those bytes — and the replies are
+counted and named in the next wait's error instead.
 
 Whatever remains unanswered (XTGETTCAP, pixel-size reports, …) is
 recorded, and the next wait timeout names it: "the application queried
@@ -276,9 +293,9 @@ But it is an implementation detail:
   backend is a non-breaking change. The one piece of state vt100 does
   not track — the window title — termlens tracks itself in the sequence
   tracker, so it survives a backend swap too.
-- The `Emulator` trait is six methods (`process`, `snapshot`,
-  `mid_sequence`, `in_sync_update`, `input_modes`, `set_size`) —
-  deliberately the *narrowest* surface that
+- The `Emulator` trait is seven methods (`process`, `snapshot`,
+  `mid_sequence`, `in_sync_update`, `input_modes`, `mode_state`,
+  `set_size`) — deliberately the *narrowest* surface that
   the terminal loop needs, so candidate backends (wezterm-term for wider
   escape coverage, alacritty_terminal for fidelity to a real terminal's
   quirks) can be evaluated behind a feature flag without touching layer 3+.

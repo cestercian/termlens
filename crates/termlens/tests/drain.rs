@@ -62,6 +62,28 @@ fn undelivered_replies_are_named_in_the_diagnosis() {
     );
 }
 
+// Not automated here: that a write into a *full* PTY buffer gives up at
+// the terminal's deadline instead of blocking forever. Provoking one
+// means getting a kernel to stop absorbing writes, and the platforms
+// disagree at every turn — macOS swallows a single 256 KiB write in
+// 13ms but blocks on small repeated ones; Linux absorbs far more before
+// blocking, and keeps the master writable even after the child is gone.
+// Four attempts produced four behaviours and no stable gate, and a
+// flaky test for a hang is worse than none: it teaches people to rerun
+// CI.
+//
+// The guarantee itself was verified by hand on both platforms; the
+// ubuntu run of this branch printed exactly:
+//
+//     termlens: failed to send literal text to `/bin/sh -c ...` (the
+//     application is not reading its input, and the PTY buffer is full
+//     — no progress in 700ms)
+//     --- screen ---
+//
+// The mechanism that produces it — every write acknowledged by the
+// writer thread within the terminal's deadline — is exercised by every
+// other test in the suite, since all typed input now travels that path.
+
 /// The ordinary case must be untouched: an application that reads its
 /// replies still gets every one of them.
 #[test]
