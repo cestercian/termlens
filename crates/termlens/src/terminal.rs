@@ -598,7 +598,7 @@ impl EmuState {
 ///     .args(["-c", "echo builder-doc; read quit"])
 ///     .spawn("sh")?;
 /// t.wait_until(|s| s.contains("builder-doc"))?;
-/// # t.send(termlens::Key::Enter); // release `read quit`
+/// # t.send(termlens::Key::Enter)?; // release `read quit`
 /// # t.wait_exit()?; Ok(())
 /// # }
 /// ```
@@ -1184,32 +1184,38 @@ impl Terminal {
     /// Send one key press or modifier [`Chord`](crate::Chord). See
     /// [`Key`](crate::Key) for the encodings.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the bytes cannot be written to the PTY — the child
-    /// exited and the OS tore the terminal down, or the application
-    /// stopped reading its input and the PTY buffer filled, in which
-    /// case the write gives up at the terminal's deadline rather than
-    /// blocking forever. Either way the panic message includes the
-    /// current screen. A test that types into a program which cannot
-    /// receive it is broken; failing loudly beats a silent no-op, and
-    /// beats a hang by more.
+    /// [`Error::Write`] when the bytes cannot be handed to the child — it
+    /// released the terminal, or it stopped reading its input and the write
+    /// gave up at the terminal's deadline rather than blocking forever. The
+    /// error embeds the screen, so a CI log shows what the application was
+    /// displaying when the keystroke had nowhere to go.
     ///
-    /// [`click`](Self::click), [`scroll`](Self::scroll),
-    /// [`paste`](Self::paste) and [`send_str`](Self::send_str) share this
-    /// contract.
-    pub fn send(&mut self, key: impl Input + fmt::Debug) {
+    /// This is the same answer on every platform. A raw write to a closed
+    /// terminal fails with `EIO` on macOS and *succeeds* on Linux, where
+    /// the bytes queue up for a reader that no longer exists; termlens
+    /// checks first, so a keystroke is never silently swallowed on one OS
+    /// and reported on another.
+    ///
+    /// [`send_str`](Self::send_str), [`paste`](Self::paste),
+    /// [`click`](Self::click), [`drag`](Self::drag) and
+    /// [`scroll`](Self::scroll) share this contract.
+    pub fn send(&mut self, key: impl Input + fmt::Debug) -> Result<()> {
+        let what = format!("{key:?}");
+        self.ensure_deliverable(&what)?;
         let application_cursor = self.input_modes().application_cursor;
-        self.write_or_panic(&key.encode_modal(application_cursor), &format!("{key:?}"));
+        self.write_input(&key.encode_modal(application_cursor), &what)
     }
 
     /// Send a string literally (UTF-8 bytes, no key mapping, no newline).
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// Same contract as [`send`](Self::send).
-    pub fn send_str(&mut self, s: &str) {
-        self.write_or_panic(s.as_bytes(), "literal text");
+    pub fn send_str(&mut self, s: &str) -> Result<()> {
+        self.ensure_deliverable("literal text")?;
+        self.write_input(s.as_bytes(), "literal text")
     }
 
     /// Paste text, the way a terminal pastes.
@@ -1237,10 +1243,11 @@ impl Terminal {
     /// To send bytes with no transformation at all, use
     /// [`send_str`](Self::send_str) and write the brackets yourself.
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// Same contract as [`send`](Self::send).
-    pub fn paste(&mut self, text: &str) {
+    pub fn paste(&mut self, text: &str) -> Result<()> {
+        self.ensure_deliverable("a paste")?;
         // Real terminals send CR for a pasted line break; \r\n collapses
         // to a single CR rather than two line breaks.
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
@@ -1248,9 +1255,9 @@ impl Terminal {
             let mut bytes = b"\x1b[200~".to_vec();
             bytes.extend_from_slice(strip_paste_markers(&text).as_bytes());
             bytes.extend_from_slice(b"\x1b[201~");
-            self.write_or_panic(&bytes, "a bracketed paste");
+            self.write_input(&bytes, "a bracketed paste")
         } else {
-            self.write_or_panic(text.as_bytes(), "a paste");
+            self.write_input(text.as_bytes(), "a paste")
         }
     }
 
@@ -1262,10 +1269,12 @@ impl Terminal {
     ///
     /// # Errors
     ///
-    /// [`Error::Input`] when the application has not enabled mouse
-    /// tracking (feeding it mouse bytes anyway would be misparsed as
-    /// garbage keys), or when the position is unrepresentable in the
-    /// legacy encoding (columns/rows beyond 222).
+    /// [`Error::Write`] when the child is gone, checked *first* so a
+    /// reaped child is named as such instead of being reported as a
+    /// missing tracking mode. Then [`Error::Input`] when the application
+    /// has not enabled mouse tracking (feeding it mouse bytes anyway would
+    /// be misparsed as garbage keys), or when the position is
+    /// unrepresentable in the legacy encoding (columns/rows beyond 222).
     pub fn click(&mut self, col: u16, row: u16) -> Result<()> {
         self.click_with(MouseButton::Left, col, row)
     }
@@ -1291,6 +1300,7 @@ impl Terminal {
     ///
     /// Same conditions as [`click`](Self::click).
     pub fn click_with(&mut self, button: impl Into<MouseChord>, col: u16, row: u16) -> Result<()> {
+        self.ensure_deliverable("a mouse click")?;
         let chord = button.into();
         let modes = self.input_modes();
         let press_only = match modes.mouse {
@@ -1302,8 +1312,7 @@ impl Terminal {
         if !press_only {
             bytes.extend(self.mouse_report(&modes, chord.code(), col, row, false)?);
         }
-        self.write_or_panic(&bytes, "a mouse click");
-        Ok(())
+        self.write_input(&bytes, "a mouse click")
     }
 
     /// Drag from one cell to another: press, motion, release.
@@ -1319,15 +1328,18 @@ impl Terminal {
     ///
     /// # Errors
     ///
-    /// [`Error::Input`] when no mouse tracking is enabled, when the
-    /// tracking mode is X10, or when a position is unrepresentable in
-    /// the encoding the application selected.
+    /// [`Error::Write`] when the child is gone (checked first, as on
+    /// [`click`](Self::click)), then [`Error::Input`] when no mouse
+    /// tracking is enabled, when the tracking mode is X10, or when a
+    /// position is unrepresentable in the encoding the application
+    /// selected.
     pub fn drag(
         &mut self,
         button: impl Into<MouseChord>,
         from: (u16, u16),
         to: (u16, u16),
     ) -> Result<()> {
+        self.ensure_deliverable("a mouse drag")?;
         let chord = button.into();
         let modes = self.input_modes();
         let report_motion = match modes.mouse {
@@ -1351,8 +1363,7 @@ impl Terminal {
             bytes.extend(self.mouse_report(&modes, chord.code() + 32, to_col, to_row, true)?);
         }
         bytes.extend(self.mouse_report(&modes, chord.code(), to_col, to_row, false)?);
-        self.write_or_panic(&bytes, "a mouse drag");
-        Ok(())
+        self.write_input(&bytes, "a mouse drag")
     }
 
     /// Scroll the wheel one notch at `(col, row)` (0-based).
@@ -1361,6 +1372,7 @@ impl Terminal {
     ///
     /// Same conditions as [`click`](Self::click).
     pub fn scroll(&mut self, col: u16, row: u16, direction: Scroll) -> Result<()> {
+        self.ensure_deliverable("a mouse scroll")?;
         let modes = self.input_modes();
         if modes.mouse == MouseMode::None {
             return Err(no_mouse_tracking());
@@ -1373,8 +1385,7 @@ impl Terminal {
         };
         // Wheel events are presses only; there is no release.
         let bytes = self.mouse_report(&modes, button, col, row, true)?;
-        self.write_or_panic(&bytes, "a mouse scroll");
-        Ok(())
+        self.write_input(&bytes, "a mouse scroll")
     }
 
     fn input_modes(&self) -> InputModes {
@@ -1407,17 +1418,54 @@ impl Terminal {
         })
     }
 
-    fn write_or_panic(&mut self, bytes: &[u8], what: &str) {
-        // Build the panic message (which takes the state lock for the
-        // screen) strictly after the write attempt finishes, so no two
-        // locks are ever held together.
-        if let Err(reason) = self.write_within_deadline(bytes) {
-            panic!(
-                "termlens: failed to send {what} to `{}` ({reason})\n--- screen ---\n{}",
-                self.command_desc,
-                self.screen()
-            );
+    /// Hand `bytes` to the child, or report why it was impossible.
+    fn write_input(&mut self, bytes: &[u8], what: &str) -> Result<()> {
+        // Build the message (which takes the state lock for the screen)
+        // strictly after the write attempt finishes, so no two locks are
+        // ever held together.
+        match self.write_within_deadline(bytes) {
+            Ok(()) => Ok(()),
+            Err(reason) => Err(Error::Write {
+                what: format!("{what} to `{}` ({reason})", self.command_desc).into(),
+                screen: self.screen(),
+            }),
         }
+    }
+
+    /// Refuse an input operation nothing can receive.
+    ///
+    /// Two reasons this is a check of our own rather than a reliance on the
+    /// write failing.
+    ///
+    /// **The platforms disagree.** Writing to a master whose slave is
+    /// closed fails with `EIO` on macOS and *succeeds* on Linux, where the
+    /// bytes land in an input queue with no reader left to drain it. So
+    /// without this, the same call reports an error on one CI runner and
+    /// silently discards a keystroke on the other — and silence is the
+    /// worse half, because the test then fails at a later wait whose screen
+    /// never changed, far from the cause.
+    ///
+    /// **It gives the mouse path the right diagnosis.** Called before the
+    /// mouse-tracking check, because a child that is gone never enabled
+    /// tracking either: checking the mode first answers "no `CSI ?1000 h`
+    /// was seen", which is true and is not the reason.
+    ///
+    /// The signal is **EOF, not "did we reap something"**. EOF means every
+    /// slave descriptor is closed, which is exactly the condition under
+    /// which no one can read — while a reaped child says nothing about a
+    /// grandchild that inherited the terminal and is still reading it.
+    fn ensure_deliverable(&mut self, what: &str) -> Result<()> {
+        if !self.shared.lock().eof {
+            return Ok(());
+        }
+        let reason = match &self.exit_status {
+            Some(status) => format!("the child is gone ({status}) and the terminal is closed"),
+            None => "the child released the terminal (EOF), so nothing can read this".to_owned(),
+        };
+        Err(Error::Write {
+            what: format!("{what} to `{}` ({reason})", self.command_desc).into(),
+            screen: self.screen(),
+        })
     }
 
     /// Write to the child, bounded by the default deadline.
