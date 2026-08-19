@@ -131,9 +131,35 @@ Replies go to that same thread, fire-and-forget: writing them from the
 reader thread would block whenever the application stopped reading its
 input; the drain would stop, the child would then block writing into a
 full output buffer, and the harness would deadlock itself with no test
-input involved. A full queue means the application is not reading at
-all — so it cannot be waiting on those bytes — and the replies are
-counted and named in the next wait's error instead.
+input involved.
+
+**One queue entry per read, not per reply**, and the writer coalesces
+whatever is queued behind the entry it took into a single `write(2)`. This
+is not an optimization; it is the fix for a correctness bug. The queue was
+filling for a reason that had nothing to do with the application: the reader
+could build answers faster than the writer could issue one syscall each, so
+a startup batch of 200 probes lost 27 answers with nothing blocked anywhere
+— confirmed by spacing the same queries a millisecond apart, which answered
+all 200. The comment in the source claiming a full queue meant the
+application had stopped reading was simply false.
+
+With one entry per read, filling the queue really does take 64 reads' worth
+of undelivered answers, which no reading application produces. That makes a
+discard rare and moves the diagnosis: an application that genuinely never
+reads leaves its answers *stuck in a blocked write* rather than dropped, so
+both are counted — a lock-free pending count the writer clears only once
+bytes are actually out — and the next wait's error names the total.
+
+**How much of that is knowable differs by platform, and the honest answer is
+that Linux hides it.** A write into a full terminal input queue blocks on
+macOS, so the stuck replies are visible to us and the count is exact. Linux's
+`n_tty` driver instead *discards* input once its buffer (`N_TTY_BUF_SIZE`, 4
+KB) is full: the write succeeds, the kernel throws the bytes away, and nothing
+distinguishes that from delivery. We cannot report what we were never told, so
+on Linux an application that never reads produces a timeout carrying the
+screen and no reply count. The same kernel limit caps a legitimate batch too —
+past roughly 680 replies the application has to read as it asks, exactly as it
+would against a real terminal.
 
 `XTGETTCAP` is answered from a table of capabilities the crate actually
 implements, and every entry was checked against the code that implements it

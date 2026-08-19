@@ -23,6 +23,32 @@ listed under a **Changed** or **Removed** heading.
   therefore an error on one CI runner and silently discarded on the other.
   Every sender now checks for a closed terminal before writing, so the
   answer is the same everywhere and no keystroke is lost quietly.
+- **A batch of startup probes is answered in full.** 200 queries asked back to
+  back returned 173 answers; 400 returned 235; 1000 returned 285. The stated
+  cause — the application had stopped reading — was wrong: the same 200
+  queries a millisecond apart were all answered, so nothing was blocked
+  anywhere. The reader was enqueueing one channel entry per *reply* while the
+  writer issued one `write(2)` per entry, and the queue filled because the
+  reader outran it. Replies from one read are now one entry, the writer
+  coalesces whatever is queued behind it into a single write, and 50, 200 and
+  400 are all answered completely. The remaining ceiling is the terminal's own
+  input queue rather than ours — around 4 KB on Linux, so a batch past roughly
+  680 replies still needs the application to read as it asks, which is true of
+  a real terminal too.
+- **Undelivered replies are counted whether dropped or blocked mid-write**, so
+  a non-reading application is named in the wait error rather than producing a
+  plain timeout.
+  **One diagnosis got weaker on Linux, and that is the price of the fix
+  above.** The note used to appear there because replies overflowed *our* queue
+  — the same overflow that was losing a well-behaved application's answers.
+  With that fixed, the replies reach the kernel, and the platforms diverge: a
+  write into a full terminal input queue blocks on macOS, where the backlog
+  stays visible and the count is exact, while Linux's `n_tty` *discards* input
+  once its 4 KB buffer is full — the write succeeds, the bytes are gone, and
+  nothing distinguishes that from delivery. We cannot report what we were never
+  told. `docs/DESIGN.md` §1 states the split; the trade is a diagnosis for a
+  pathological application in exchange for a well-behaved one actually
+  receiving its answers.
 - **`drag` reports one motion per cell crossed**, on a straight interpolated
   path, instead of a single report at the destination. Seven cells crossed
   used to produce one motion event. Invisible to an application that only
