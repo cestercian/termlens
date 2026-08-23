@@ -83,9 +83,11 @@
 //! ```no_run
 //! # fn main() -> termlens::Result<()> {
 //! # let mut t = termlens::Terminal::builder().spawn("true")?;
-//! insta::assert_snapshot!(t.screen());        // plain insta…
-//! # #[cfg(feature = "insta")]
-//! termlens::assert_screen_snapshot!(t.screen()); // …or the bundled macro
+//! #[cfg(feature = "insta")]
+//! {
+//!     insta::assert_snapshot!(t.screen());        // plain insta…
+//!     termlens::assert_screen_snapshot!(t.screen()); // …or the bundled macro
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -128,7 +130,10 @@ pub use insta;
 /// ```no_run
 /// # fn main() -> termlens::Result<()> {
 /// # let t = termlens::Terminal::builder().spawn("true")?;
-/// termlens::assert_screen_snapshot!(t.screen());
+/// #[cfg(feature = "insta")]
+/// {
+///     termlens::assert_screen_snapshot!(t.screen());
+/// }
 /// # Ok(())
 /// # }
 /// ```
