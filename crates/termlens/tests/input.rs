@@ -31,6 +31,15 @@ fn clicks_round_trip_through_the_apps_tracking_mode() -> termlens::Result<()> {
     t.scroll(3, 2, Scroll::Down)?;
     t.wait_frame(|s| s.contains("last: mouse:scrolldown:3,2"))?;
 
+    // Modified wheel notches, decoded by crossterm's own parser: the zoom
+    // and horizontal-scroll idioms, which had no way onto the wire before.
+    t.scroll_with(Scroll::Up.ctrl(), 3, 2)?;
+    t.wait_frame(|s| s.contains("last: mouse:ctrl+scrollup:3,2"))?;
+    t.scroll_with(Scroll::Down.shift(), 4, 1)?;
+    t.wait_frame(|s| s.contains("last: mouse:shift+scrolldown:4,1"))?;
+    t.scroll_with(Scroll::Up.ctrl().alt(), 3, 2)?;
+    t.wait_frame(|s| s.contains("last: mouse:ctrl+alt+scrollup:3,2"))?;
+
     t.send(Key::Esc)?;
     assert!(t.wait_exit()?.success());
     Ok(())
@@ -220,6 +229,10 @@ fn buttons_modifiers_drag_and_horizontal_wheel_reach_the_wire() -> termlens::Res
     t.click_with(termlens::MouseButton::Right, 10, 4)?;
     t.click_with(termlens::MouseButton::Left.ctrl(), 3, 1)?;
     t.scroll(5, 5, termlens::Scroll::Left)?;
+    // Ctrl-wheel-up (64 + 16) and Shift-wheel-down (65 + 4): the modifiers
+    // ride on the wheel's button code exactly as they do on a click.
+    t.scroll_with(termlens::Scroll::Up.ctrl(), 5, 5)?;
+    t.scroll_with(termlens::Scroll::Down.shift(), 5, 5)?;
     // Drag left button from (2,2) to (6,3): press, motion (0+32), release.
     t.drag(termlens::MouseButton::Left, (2, 2), (6, 3))?;
 
@@ -231,6 +244,8 @@ fn buttons_modifiers_drag_and_horizontal_wheel_reach_the_wire() -> termlens::Res
         "[<16;4;2M",
         "[<16;4;2m", // ctrl + left
         "[<66;6;6M", // horizontal wheel
+        "[<80;6;6M", // ctrl + wheel up
+        "[<69;6;6M", // shift + wheel down
         // Drag (2,2) -> (6,3): press, one motion per crossed cell, release.
         "[<0;3;3M",
         "[<32;4;3M",
@@ -420,13 +435,23 @@ fn mouse_events_outside_the_grid_are_refused() -> termlens::Result<()> {
     assert!(err.to_string().contains("20x5"), "{err}");
 
     // After a shrink, a coordinate that was valid earlier must name the
-    // *new* size — otherwise the error reads as a mystery.
-    t.resize(10, 3)?;
+    // *new* size — otherwise the error reads as a mystery. Wide enough for
+    // the fixture's acknowledgement to fit on its row, and still excluding
+    // (19, 4) on both axes.
+    t.resize(18, 4)?;
+    // Wait for the application to have handled the SIGWINCH before sending
+    // it anything: a keystroke arriving in the same instant as the resize
+    // can be lost by crossterm's event reader — see `Terminal::resize`. The
+    // stress workflow found this at 8 threads on its first iteration, and it
+    // reproduced locally about one run in forty. `wait_frame` is the right
+    // wait: a resize advances the frame cursor, so only a frame drawn after
+    // it can satisfy this.
+    t.wait_frame(|s| s.contains("last: resize:18x4"))?;
     let err = t.click(19, 4).expect_err("pre-resize coordinate");
     assert!(matches!(err, Error::Input(_)), "got: {err}");
     let msg = err.to_string();
     assert!(msg.contains("(19, 4)"), "{msg}");
-    assert!(msg.contains("10x3"), "post-resize size: {msg}");
+    assert!(msg.contains("18x4"), "post-resize size: {msg}");
     assert!(!msg.contains("20x5"), "must not report the old size: {msg}");
 
     t.send(Key::Esc)?;
