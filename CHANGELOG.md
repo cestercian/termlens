@@ -53,7 +53,8 @@ listed under a **Changed** or **Removed** heading.
   `ESC N` (SS2) / `ESC O` (SS3) invoke that set for exactly one character
   before the locking shift resumes. The designation was already consumed;
   the shift did nothing, so a mixed line of text and box-drawing showed
-  the letter. A pending single shift does not survive `RIS`. Locking
+  the letter. A pending single shift is consumed by the next character —
+  including a multi-byte UTF-8 one — and does not survive `RIS`. Locking
   shifts remain G0/G1 only (`SO`/`SI`); `LS2`/`LS3` and `DECSC`/`DECRC` of
   charset state are still unmodelled. (#235)
 

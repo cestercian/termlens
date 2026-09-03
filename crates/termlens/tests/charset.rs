@@ -144,3 +144,28 @@ fn a_pending_single_shift_does_not_survive_ris() -> termlens::Result<()> {
     assert!(t.wait_exit()?.success());
     Ok(())
 }
+
+/// A single shift lasts for one *character*: CJK, emoji and `é` consume
+/// it, so a graphics byte after them stays a letter. The old GL-only
+/// consume left the shift pending and turned that `l` into `┌`.
+#[test]
+fn a_multibyte_character_consumes_a_single_shift() -> termlens::Result<()> {
+    let mut t = sh(concat!(
+        r"printf '\033*0\033N汉l\n'; ",
+        r"printf '\033*0\033N🦀l\n'; ",
+        r"printf '\033*0\033Nél\n'; ",
+        "printf DONE; read _"
+    ))?;
+    t.wait_until(|s| s.contains("DONE"))?;
+    let s = t.screen();
+    assert_eq!(s.row_text(0).trim_end(), "汉l", "{s}");
+    assert_eq!(s.row_text(1).trim_end(), "🦀l", "{s}");
+    assert_eq!(s.row_text(2).trim_end(), "él", "{s}");
+    assert!(
+        !s.contains("┌"),
+        "the shift must not survive the multi-byte character:\n{s}"
+    );
+    t.send(Key::Enter)?;
+    assert!(t.wait_exit()?.success());
+    Ok(())
+}

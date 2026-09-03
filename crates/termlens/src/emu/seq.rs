@@ -166,7 +166,7 @@ fn dec_special_graphics(b: u8) -> Option<&'static str> {
     })
 }
 
-/// SS2/SS3 invoke G2/G3 for exactly one GL character, then the locking
+/// SS2/SS3 invoke G2/G3 for exactly one character, then the locking
 /// shift resumes. Stored as which *slot* to read, not a copy of the set:
 /// a designation between the shift and the character still applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,8 +399,8 @@ pub(crate) struct SeqTracker {
     /// True after `SO` (`0x0e`) invoked G1; `SI` (`0x0f`) returns to G0.
     /// Single shifts override this for one character without changing it.
     shifted_out: bool,
-    /// Pending SS2/SS3, if any. Cleared by the next GL character, or by
-    /// RIS; an intervening control or designation must not consume it, or a
+    /// Pending SS2/SS3, if any. Cleared by the next character, or by RIS;
+    /// an intervening control or designation must not consume it, or a
     /// mixed line that shifts then redraws would lose the graphic.
     single_shift: Option<SingleShift>,
     /// Which introducer opened the current DCS-class string: `P` (DCS),
@@ -1178,11 +1178,15 @@ impl SeqTracker {
                             }
                         }
                     }
-                    // A single shift lasts for one GL character. C0 controls
-                    // and nested sequences must not consume it: SS2 then SI
-                    // then `l` still draws from G2, which is the mixed-line
-                    // case this exists for. RIS clears it separately.
-                    if (0x20..=0x7e).contains(&b) {
+                    // A single shift lasts for one *character*, not one byte:
+                    // a multi-byte UTF-8 character consumes it too, so a
+                    // continuation byte must not, or the shift survives `汉`
+                    // and translates the byte after it. C0, DEL and newline
+                    // still do not consume it: SS2 then SI then `l` draws
+                    // from G2, which is the mixed-line case this exists for.
+                    // RIS clears it separately.
+                    let utf8_continuation = (0x80..=0xbf).contains(&b);
+                    if b >= 0x20 && b != 0x7f && !utf8_continuation {
                         self.single_shift = None;
                     }
                     self.track_utf8(b);
@@ -1240,7 +1244,7 @@ impl SeqTracker {
                     self.close_link();
                     State::Ground
                 }
-                // SS2 / SS3: invoke G2 / G3 for the next GL character only.
+                // SS2 / SS3: invoke G2 / G3 for the next character only.
                 // These are two-character escapes in the *output* stream;
                 // `ESC O A` as a DECCKM cursor key is what we *send*, a
                 // different direction, and is not parsed here.
@@ -2034,11 +2038,34 @@ mod tests {
     #[test]
     fn a_single_shift_survives_intervening_controls_and_designations() {
         assert_eq!(drawn(b"\x1b*0\x1bN\x0fl"), "\u{250c}");
+        assert_eq!(drawn(b"\x1b*0\x1bN\x7fl"), "\u{250c}");
         assert_eq!(drawn(b"\x1b*0\x1bN\x1b(Bl"), "\u{250c}");
         // A designation into G2 between the shift and the character still
         // applies: the slot is read when the character is drawn.
         assert_eq!(drawn(b"\x1b*0\x1bN\x1b*Bl"), "l");
         assert_eq!(drawn(b"\x1bN\x1b*0l"), "\u{250c}");
+    }
+
+    /// A single shift is one *character*: CJK, emoji and `é` consume it,
+    /// so the graphics byte after them is a letter. `drawn` skips UTF-8,
+    /// so this asks the tracker after the character rather than concatenating.
+    #[test]
+    fn a_multibyte_character_consumes_a_single_shift() {
+        for ch in ["汉", "🦀", "é"] {
+            let mut t = SeqTracker::new(crate::graphics::DEFAULT_CAPTURE);
+            t.feed(b"\x1b*0\x1bN");
+            assert_eq!(
+                t.graphics_glyph(b'l'),
+                Some("\u{250c}"),
+                "shift pending before {ch}"
+            );
+            t.feed(ch.as_bytes());
+            assert_eq!(
+                t.graphics_glyph(b'l'),
+                None,
+                "shift must not survive {ch} and translate the next l"
+            );
+        }
     }
 
     #[test]
