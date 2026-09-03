@@ -29,6 +29,50 @@ fn an_empty_program_name_is_a_short_typed_error() {
 }
 
 #[test]
+fn the_default_working_directory_is_the_test_process_s() -> termlens::Result<()> {
+    // Without `current_dir` the child used to start in $HOME — the PTY
+    // layer's fallback — while `current_dir`'s rustdoc said it inherited the
+    // test runner's (#215). Pinned here so the default cannot move quietly.
+    let mut t = Terminal::builder().spawn("/bin/pwd")?;
+    assert!(t.wait_exit()?.success());
+    let reported = std::path::PathBuf::from(t.screen().row_text(0).trim());
+    let expected = std::env::current_dir()?;
+    assert_eq!(
+        reported.canonicalize()?,
+        expected.canonicalize()?,
+        "child ran in {} rather than the test process's {}",
+        reported.display(),
+        expected.display()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_bare_program_name_under_env_clear_is_refused_with_the_remedies() {
+    // env_clear drops PATH, and the PTY layer's only diagnostic for the bare
+    // name that then cannot resolve was "Unable to resolve the PATH" (#222).
+    let err = Terminal::builder().env_clear().spawn("sh").unwrap_err();
+    assert!(matches!(err, Error::Spawn { .. }), "{err}");
+    let msg = err.to_string();
+    for needed in ["`sh`", "env_clear", "PATH", "absolute path"] {
+        assert!(msg.contains(needed), "missing {needed:?} in: {msg}");
+    }
+    // Either remedy works: a PATH of the test's own…
+    let with_path = Terminal::builder()
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .args(["-c", "true"])
+        .spawn("sh");
+    assert!(with_path.is_ok(), "{:?}", with_path.err());
+    // …or an absolute path, which never needed one.
+    let absolute = Terminal::builder()
+        .env_clear()
+        .args(["-c", "true"])
+        .spawn("/bin/sh");
+    assert!(absolute.is_ok(), "{:?}", absolute.err());
+}
+
+#[test]
 fn a_missing_working_directory_fails_instead_of_running_elsewhere() {
     let missing = std::env::temp_dir().join("termlens-no-such-dir-xyz");
     assert!(!missing.is_dir(), "test precondition");
@@ -66,6 +110,58 @@ fn a_file_is_not_a_working_directory() {
     let _ = std::fs::remove_file(&file);
 }
 
+/// One column panics the emulator on a double-width character, and one row
+/// panics it on a line that wraps — on the reader thread, in both profiles,
+/// where the symptom is a frozen screen and a wait that runs to its
+/// deadline while cargo prints `test result: ok` (#211). The guard against
+/// zero was one value too low on each axis.
+#[test]
+fn a_single_row_or_column_is_refused_like_a_zero() {
+    for (cols, rows) in [(1u16, 8u16), (80, 1), (1, 1), (2, 1), (1, 2)] {
+        let err = Terminal::builder()
+            .size(cols, rows)
+            .args(["-c", "true"])
+            .spawn("/bin/sh")
+            .expect_err(&format!("{cols}x{rows} must be refused"));
+        assert!(matches!(err, Error::Size(_)), "{cols}x{rows}: got {err}");
+        assert!(
+            err.to_string().contains("at least 2"),
+            "the message must name the floor: {err}"
+        );
+    }
+}
+
+/// The two shapes that used to kill the emulator thread, at the smallest
+/// size still allowed. Both must render — the floor is the smallest guard
+/// that closes the panics, not a retreat from small terminals.
+#[test]
+fn the_narrowest_allowed_terminal_renders_both_trigger_shapes() -> termlens::Result<()> {
+    // Trigger A was one column meeting a double-width character.
+    let mut wide = Terminal::builder()
+        .size(2, 8)
+        .timeout(Duration::from_secs(5))
+        .args(["-c", r"printf '\346\261\211'; read guard"])
+        .spawn("/bin/sh")?;
+    wide.wait_until(|s| s.contains("汉"))?;
+    assert_eq!(wide.screen().row_text(0).trim_end(), "汉");
+    wide.send(termlens::Key::Enter)?;
+    wide.wait_exit()?;
+
+    // Trigger B was one row meeting a line that wraps.
+    let mut wrap = Terminal::builder()
+        .size(2, 2)
+        .timeout(Duration::from_secs(5))
+        .args(["-c", r"printf 'abcZ'; read guard"])
+        .spawn("/bin/sh")?;
+    wrap.wait_until(|s| s.contains("Z"))?;
+    let screen = wrap.screen();
+    assert_eq!(screen.row_text(0).trim_end(), "ab", "{screen}");
+    assert_eq!(screen.row_text(1).trim_end(), "cZ", "{screen}");
+    wrap.send(termlens::Key::Enter)?;
+    wrap.wait_exit()?;
+    Ok(())
+}
+
 /// A zero dimension used to reach vt100, which panicked on an
 /// overflowing subtraction in debug builds and — worse — panicked on the
 /// *reader thread* in release builds, killing the drain silently.
@@ -95,17 +191,22 @@ fn resize_to_zero_is_refused_without_touching_the_pty_or_the_grid() -> termlens:
         .spawn("/bin/sh")?;
     t.wait_until(|s| s.contains("ready"))?;
 
-    for (cols, rows) in [(0u16, 24u16), (80, 0), (0, 0)] {
+    // Zero, and — the value the guard used to let through — one, on each
+    // axis (#211). `resize(cols - 1, …)` walked down in a loop reaches both
+    // by ordinary arithmetic.
+    for (cols, rows) in [(0u16, 24u16), (80, 0), (0, 0), (1, 24), (80, 1), (1, 1)] {
         let err = t
             .resize(cols, rows)
-            .expect_err("a terminal cannot have a zero dimension");
+            .expect_err("a terminal needs at least two columns and two rows");
         assert!(matches!(err, Error::Size(_)), "{cols}x{rows}: got {err}");
     }
-
     // The grid is untouched and the terminal still works.
     assert_eq!(t.screen().size(), (80, 24));
     t.resize(70, 20)?;
     assert_eq!(t.screen().size(), (70, 20));
+    // …and the floor itself is a legal size to resize to.
+    t.resize(2, 2)?;
+    assert_eq!(t.screen().size(), (2, 2));
     t.send(termlens::Key::Enter)?;
     assert!(t.wait_exit()?.success());
     Ok(())

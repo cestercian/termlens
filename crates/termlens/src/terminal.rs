@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
@@ -23,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::keys::Input;
 use crate::keys::{mouse_legacy, mouse_sgr, mouse_utf8};
 use crate::screen::{MouseMode, Screen};
+use crate::utf8::Utf8Sanitizer;
 use crate::wait::{next_backoff, Expired, Monitor, INITIAL_BACKOFF, POLL_CAP};
 
 /// How long `wait_exit` keeps draining PTY output after the child has been
@@ -650,8 +652,25 @@ impl ExitStatus {
         self.code
     }
 
-    /// The name of the signal that terminated the child, if it died from a
-    /// signal (e.g. `"Hangup"`, `"Killed: 9"`). `None` for a normal exit.
+    /// The signal that terminated the child, if it died from one, as the
+    /// host C library describes it — `strsignal(3)`. `None` for a normal
+    /// exit.
+    ///
+    /// The spelling is the platform's, not this crate's: `SIGTERM` reads
+    /// `"Terminated"` on glibc and `"Terminated: 15"` on macOS, `SIGKILL`
+    /// `"Killed"` and `"Killed: 9"`. A portable assertion therefore uses
+    /// `contains`, never `==`:
+    ///
+    /// ```no_run
+    /// # fn main() -> termlens::Result<()> {
+    /// # let mut t = termlens::Terminal::builder().args(["-c", "sleep 30"]).spawn("sh")?;
+    /// t.signal(termlens::Signal::Term)?;
+    /// let status = t.wait_exit()?;
+    /// let signal = status.signal().expect("killed, not exited");
+    /// assert!(signal.contains("Terminated"), "status: {status}");
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// Distinguishing "the app exited 1" from "something killed the app" is
     /// the difference between a failing test and a failing test *harness* —
@@ -695,6 +714,19 @@ struct EmuState {
     last_activity: Instant,
     /// Set once the PTY read side reaches EOF; nothing more can arrive.
     eof: bool,
+    /// The emulator panicked while processing output, with its message.
+    ///
+    /// Set on the reader thread; read by every screen-based wait, which
+    /// fails at once rather than running to a deadline against a grid that
+    /// stopped advancing (#211). Once set, the emulator is never called
+    /// again — after a panic its state means nothing — so the snapshot
+    /// frozen in `snapshot_cache` is what every later observation returns.
+    emu_panic: Option<String>,
+    /// The reader is holding the incomplete tail of a multi-byte character
+    /// for the next read. The emulator never sees a partial character now
+    /// that decoding happens before it (#217), so this is what keeps
+    /// `wait_idle` from calling a stream that stopped mid-character silence.
+    utf8_pending: bool,
     /// Bumped on every state change (bytes, EOF, resize). Lets waiters skip
     /// re-evaluation on spurious wakes, and keys the snapshot cache.
     generation: u64,
@@ -770,12 +802,19 @@ impl EmuState {
             graphics,
             term_name,
         } = responder;
+        let emu_snapshot = emu.snapshot();
         Self {
             emu,
             last_activity: Instant::now(),
             eof: false,
+            utf8_pending: false,
+            emu_panic: None,
             generation: 0,
-            snapshot_cache: None,
+            // Seeded so a frozen screen always exists: an emulator that
+            // panics on its very first read must still leave the error and
+            // `screen()` something true to show, and the blank grid it was
+            // spawned with is exactly that.
+            snapshot_cache: Some((0, emu_snapshot)),
             frames_seen: 0,
             frames: VecDeque::with_capacity(FRAME_HISTORY),
             timings: VecDeque::new(),
@@ -945,8 +984,28 @@ impl EmuState {
     }
 
     /// Build a snapshot and stamp on the state the emulator does not own.
+    ///
+    /// After the emulator has panicked this returns the last screen taken
+    /// before it did, and never calls into the emulator again: its grid is
+    /// then in whatever state the panic left it, and reading it could panic
+    /// a second time — on the *test* thread, where it would surface as a
+    /// crash rather than as the typed error the waits produce (#211).
     fn build_snapshot(&self) -> Screen {
+        if self.emu_panic.is_some() {
+            if let Some((_, screen)) = &self.snapshot_cache {
+                return screen.clone();
+            }
+        }
         self.emu.snapshot().with_repaints(self.frames_seen)
+    }
+
+    /// The error every screen-based wait returns once the emulator has
+    /// failed. `None` while it is healthy.
+    fn emulator_failure(&self) -> Option<Error> {
+        self.emu_panic.as_ref().map(|detail| Error::Emulator {
+            detail: detail.clone(),
+            screen: self.peek_snapshot(),
+        })
     }
 
     /// One-line diagnosis when a query went unanswered, appended to every
@@ -1080,10 +1139,13 @@ impl Default for TerminalBuilder {
 impl TerminalBuilder {
     /// Terminal size as columns × rows. Defaults to 80×24.
     ///
-    /// Both dimensions must be non-zero and at most **1000**;
+    /// Both dimensions must be at least **2** and at most **1000**;
     /// [`spawn`](Self::spawn) rejects anything else with [`Error::Size`]
     /// rather than letting the emulator meet a size no terminal can have,
-    /// or one it can only serve slowly enough to look broken.
+    /// or one it can only serve slowly enough to look broken. The floor is
+    /// 2 rather than 1 on *both* axes because the emulator panics at one
+    /// column on a double-width character and at one row on a line that
+    /// wraps — `check_size` says why.
     ///
     /// # What a large grid costs
     ///
@@ -1168,11 +1230,21 @@ impl TerminalBuilder {
         self
     }
 
-    /// Don't inherit the parent process environment: the child sees only
-    /// variables set via [`env`](Self::env) or [`envs`](Self::envs) (plus the
-    /// default `TERM`, see [`spawn`](Self::spawn)). Strict control keeps tests
-    /// hermetic — a developer's exotic `LS_COLORS` should never change a
-    /// snapshot.
+    /// Don't inherit the parent process environment: the child sees exactly
+    /// the variables set via [`env`](Self::env) or [`envs`](Self::envs), plus
+    /// the two the harness pins itself unless you set them —
+    /// `TERM=xterm-256color` and `SHELL=/bin/sh` (see [`spawn`](Self::spawn)).
+    /// Nothing else, on any machine: a developer's exotic `LS_COLORS` should
+    /// never change a snapshot, and neither should their login shell. A
+    /// hermetic environment is not a hermetic working directory, though: the
+    /// child still starts in the test process's directory unless
+    /// [`current_dir`](Self::current_dir) says otherwise.
+    ///
+    /// Clearing the environment removes `PATH` with everything else, so a
+    /// bare program name has nothing to resolve against. [`spawn`](Self::spawn)
+    /// refuses one with an [`Error::Spawn`] that names the two ways out — an
+    /// absolute path, or a `PATH` of your own via [`env`](Self::env) — rather
+    /// than letting the PTY layer report "Unable to resolve the PATH".
     ///
     /// Note this differs from `std::process::Command::env_clear`, which also
     /// discards explicitly set variables; here `env()` and `envs()` entries
@@ -1183,9 +1255,12 @@ impl TerminalBuilder {
         self
     }
 
-    /// Run the program with `dir` as its working directory instead of
-    /// inheriting the test runner's. Directory-sensitive programs no
-    /// longer need a `cd … && …` through a shell.
+    /// Run the program with `dir` as its working directory. The default is
+    /// the test process's own — what `std::process::Command` does — so a
+    /// relative program path or a directory-sensitive program behaves as it
+    /// would under any other Rust process API, and no `cd … && …` through a
+    /// shell is needed. (Before 0.9 the default was the PTY layer's
+    /// fallback, `$HOME`, while this text claimed otherwise: #215.)
     ///
     /// [`spawn`](Self::spawn) fails with [`Error::Spawn`] if `dir` is not
     /// an existing directory — running somewhere else instead would make
@@ -1352,6 +1427,19 @@ impl TerminalBuilder {
         if program.is_empty() {
             return spawn_err("no program name given (the program argument was empty)".into());
         }
+        // env_clear removes PATH with everything else, and a bare name then
+        // has nothing to resolve against; the PTY layer's "Unable to resolve
+        // the PATH" named neither the cause nor a remedy (#222).
+        if self.env_clear
+            && !self.envs.iter().any(|(k, _)| k == "PATH")
+            && !program.to_string_lossy().contains('/')
+        {
+            return spawn_err(format!(
+                "`{}` is a bare program name and env_clear() removed PATH, so nothing can \
+                 resolve it — give an absolute path, or set a PATH with .env(\"PATH\", …)",
+                program.to_string_lossy()
+            ));
+        }
         check_size(self.cols, self.rows)?;
         // portable-pty filters the cwd through is_dir() and silently falls
         // back to the home directory. Sensible for a terminal emulator,
@@ -1374,13 +1462,20 @@ impl TerminalBuilder {
     /// `TERM=xterm-256color` — matching the escape sequences the emulator
     /// speaks, and deterministic regardless of the host environment.
     ///
+    /// The child starts in the test process's working directory unless
+    /// [`current_dir`](Self::current_dir) names another. Under
+    /// [`env_clear`](Self::env_clear) it also gets `SHELL=/bin/sh` unless
+    /// `SHELL` was set explicitly, so its environment is a function of the
+    /// builder alone rather than of the machine's login shell.
+    ///
     /// # Errors
     ///
     /// [`Error::Spawn`] when the configuration cannot produce a runnable
     /// command (empty program name, missing
-    /// [`current_dir`](Self::current_dir)) or the program cannot be
-    /// executed; [`Error::Size`] when the configured
-    /// [`size`](Self::size) has a zero dimension or one past the
+    /// [`current_dir`](Self::current_dir), a bare program name under
+    /// [`env_clear`](Self::env_clear) with no `PATH` to resolve it) or the
+    /// program cannot be executed; [`Error::Size`] when the configured
+    /// [`size`](Self::size) has a dimension below 2 or past the
     /// 1000-per-axis limit; [`Error::Pty`] when the PTY cannot be opened.
     pub fn spawn(self, program: impl AsRef<OsStr>) -> Result<Terminal> {
         let program = program.as_ref();
@@ -1410,8 +1505,18 @@ impl TerminalBuilder {
 
         let mut cmd = CommandBuilder::new(program);
         cmd.args(&self.args);
-        if let Some(dir) = &self.cwd {
-            cmd.cwd(dir);
+        // Always set: without a cwd the PTY layer falls back to $HOME, which
+        // made a relative program path and a directory-sensitive program
+        // behave unlike every other Rust process API while `current_dir`'s
+        // rustdoc promised the opposite (#215). The test process's own
+        // directory is the default `std::process::Command` gives.
+        match &self.cwd {
+            Some(dir) => cmd.cwd(dir),
+            None => {
+                if let Ok(here) = std::env::current_dir() {
+                    cmd.cwd(here);
+                }
+            }
         }
         if self.env_clear {
             cmd.env_clear();
@@ -1425,6 +1530,13 @@ impl TerminalBuilder {
         );
         if !self.envs.iter().any(|(k, _)| k == "TERM") {
             cmd.env("TERM", "xterm-256color");
+        }
+        // The PTY layer fills SHELL from the host's login shell when the
+        // variable is absent, which put one machine-shaped value inside an
+        // environment env_clear promises is hermetic (#221). Pinned the way
+        // TERM is; an explicit `.env("SHELL", …)` still wins.
+        if self.env_clear && !self.envs.iter().any(|(k, _)| k == "SHELL") {
+            cmd.env("SHELL", "/bin/sh");
         }
         for (key, value) in &self.envs {
             cmd.env(key, value);
@@ -1603,6 +1715,8 @@ fn strip_paste_markers(text: &str) -> String {
 /// 5000x5000 was accepted and turned the first wait into a 16-second
 /// timeout that blamed the predicate.
 const MAX_DIMENSION: u16 = 1000;
+/// The smallest grid the emulator can serve. Not 1: see `check_size`.
+const MIN_DIMENSION: u16 = 2;
 
 /// The value termlens can truthfully report for a terminfo capability, or
 /// `None` to decline it.
@@ -1726,16 +1840,33 @@ fn pixel_span(cells: u16, per_cell: Option<u16>) -> u16 {
 
 /// Reject a terminal size that cannot work, or cannot work usefully.
 ///
-/// A terminal has at least one row and one column. Letting a zero reach
-/// the emulator is not a graceful degradation: in debug builds vt100
-/// panics on an overflowing subtraction, and in release builds (the
-/// stress workflow runs `--release`) the arithmetic wraps, `spawn` and
-/// `resize` return `Ok`, and vt100 panics on the first printable byte —
-/// on the reader thread, where nothing propagates it. The drain dies
-/// silently, every later snapshot is blank, and a careless test goes
-/// green. Zeroes arrive from ordinary arithmetic (`resize(cols - 1, …)`
-/// in a loop), so this must be a typed error, not a panic in a
-/// dependency.
+/// Letting a zero reach the emulator is not a graceful degradation: in
+/// debug builds vt100 panics on an overflowing subtraction, and in release
+/// builds (the stress workflow runs `--release`) the arithmetic wraps,
+/// `spawn` and `resize` return `Ok`, and vt100 panics on the first
+/// printable byte — on the reader thread, where nothing propagates it. The
+/// drain dies silently, every later snapshot is blank, and a careless test
+/// goes green. Zeroes arrive from ordinary arithmetic (`resize(cols - 1, …)`
+/// in a loop), so this must be a typed error, not a panic in a dependency.
+///
+/// The floor is **2 per axis**, not 1, and each axis has its own reason —
+/// the guard against zero was one value too low on both (#211):
+///
+/// - `cols == 1` and a double-width character: vt100 computes
+///   `size.cols - width` with `cols = 1` and `width = 2`. Rows are
+///   irrelevant; `1x8` printing `汉` is enough.
+/// - `rows == 1` and a line that *wraps* past the last column. Columns are
+///   irrelevant: an entirely ordinary `80x1` printing a 100-character line
+///   panics, and so do `20x1` and `2x1`. A one-row terminal that scrolls by
+///   newline rather than by wrapping is fine, which is what made this look
+///   like an exotic case rather than an everyday one.
+///
+/// Both panic on the reader thread, in both profiles, so the symptom is the
+/// one described above: a frozen screen and a wait that runs to its
+/// deadline. Measured at the floor: `2x8` and `2x2` with a wide character
+/// render correctly, and `1x2` with a wrap does too — so 2 per axis is the
+/// smallest guard that closes both, and the narrowest useful terminal is
+/// still allowed.
 ///
 /// The upper bound exists for the mirror-image reason. Nothing rejected an
 /// implausible size, and a snapshot costs O(cells), so a transposed or
@@ -1744,10 +1875,12 @@ fn pixel_span(cells: u16, per_cell: Option<u16>) -> u16 {
 /// out, with a message about the predicate and no hint that the size was
 /// the problem. A named error at the call site is the whole fix.
 fn check_size(cols: u16, rows: u16) -> Result<()> {
-    if cols == 0 || rows == 0 {
+    if cols < MIN_DIMENSION || rows < MIN_DIMENSION {
         return Err(Error::Size(format!(
-            "a terminal needs at least one column and one row, got {cols}x{rows} \
-             (columns x rows)"
+            "a terminal needs at least {MIN_DIMENSION} columns and {MIN_DIMENSION} \
+             rows, got {cols}x{rows} (columns x rows); at one column the emulator \
+             panics on a double-width character, and at one row it panics on a line \
+             that wraps"
         )));
     }
     if cols > MAX_DIMENSION || rows > MAX_DIMENSION {
@@ -1815,6 +1948,21 @@ fn query_shape(query: &Query) -> String {
     }
 }
 
+/// A panic payload as a message, for [`Error::Emulator`].
+///
+/// Call it as `panic_detail(&*payload)`: `&payload` on a
+/// `Box<dyn Any + Send>` unsizes to a `&dyn Any` whose concrete type is the
+/// *box*, so every downcast below misses and the message is lost.
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "the emulator panicked with no message".to_owned()
+    }
+}
+
 /// Drain the PTY into the emulator until EOF. Runs on a dedicated thread.
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
@@ -1825,26 +1973,60 @@ fn reader_loop(
     queued_bytes: &AtomicUsize,
 ) {
     let mut buf = [0u8; 8192];
+    // Invalid UTF-8 becomes U+FFFD here, once, so both parsers see the same
+    // valid stream and a stray byte holds its column instead of vanishing
+    // (#217). A character split across two reads is carried, not replaced.
+    let mut sanitizer = Utf8Sanitizer::default();
+    let mut at_eof = false;
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                // The emulator stops at each DEC 2026 frame end and at
-                // each query, so state read there (screen, cursor) is
-                // exact — even when the same chunk already carries the
-                // following bytes. Replies are BUILT under the state
-                // lock but WRITTEN after it is released; the state lock
-                // and the writer lock are never held together.
-                let replies = shared.mutate(|state| {
-                    // Counted before the chunk is processed, so a query
-                    // inside it is recorded against *this* read: output
-                    // batched into the same write as the probe must not
-                    // read as the application having moved past it.
-                    state.reads += 1;
-                    let mut replies: Vec<Vec<u8>> = Vec::new();
-                    let mut offset = 0;
-                    while offset < n {
-                        let processed = state.emu.process(&buf[offset..n]);
+        let chunk: Vec<u8> = match reader.read(&mut buf) {
+            Ok(0) => {
+                // Whatever the sanitizer still holds was never completed.
+                at_eof = true;
+                let tail = sanitizer.finish();
+                if tail.is_empty() {
+                    break;
+                }
+                tail
+            }
+            Ok(n) => sanitizer.feed(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // Linux reports EIO on the master once the child side is gone;
+            // treat any hard error as end-of-stream.
+            Err(_) => break,
+        };
+        let utf8_pending = sanitizer.pending();
+        {
+            // The emulator stops at each DEC 2026 frame end and at
+            // each query, so state read there (screen, cursor) is
+            // exact — even when the same chunk already carries the
+            // following bytes. Replies are BUILT under the state
+            // lock but WRITTEN after it is released; the state lock
+            // and the writer lock are never held together.
+            let replies = shared.mutate(|state| {
+                // A panicked emulator is never fed again: its grid is in
+                // whatever state the panic left it. The loop still runs, so
+                // the PTY keeps draining and the child does not block
+                // writing into a full buffer — the same reason the reply
+                // queue never backpressures the reader.
+                if state.emu_panic.is_some() {
+                    return Vec::new();
+                }
+                // Counted before the chunk is processed, so a query
+                // inside it is recorded against *this* read: output
+                // batched into the same write as the probe must not
+                // read as the application having moved past it.
+                state.reads += 1;
+                let mut replies: Vec<Vec<u8>> = Vec::new();
+                let mut offset = 0;
+                // The emulation is a dependency running on a thread whose
+                // panics propagate nowhere, so it is caught here and turned
+                // into a fact about the terminal that every wait can report
+                // (#211). AssertUnwindSafe: on the panic path `state` is
+                // only ever read again through the frozen snapshot.
+                let processing = panic::catch_unwind(AssertUnwindSafe(|| {
+                    while offset < chunk.len() {
+                        let processed = state.emu.process(&chunk[offset..]);
                         offset += processed.consumed;
                         match processed.stop {
                             Some(Stop::FrameComplete(span)) => {
@@ -1880,69 +2062,80 @@ fn reader_loop(
                             None => {}
                         }
                     }
-                    state.touch();
-                    replies
-                });
-                // One queue entry per *read*, not per reply. A single read
-                // can carry dozens of queries — a startup batch is a
-                // legitimate pattern — and enqueueing each answer separately
-                // made the reader outrun the writer, which issues one
-                // `write(2)` per entry. The queue then filled and answers
-                // were discarded although nothing was blocked: measured at
-                // 173 of 200 delivered back-to-back, and 200 of 200 with a
-                // millisecond between the queries. Batching is what removes
-                // that mismatch; ordering is unchanged, since the bytes are
-                // concatenated in the order they were built.
-                if !replies.is_empty() {
-                    let batch: Vec<u8> = replies.concat();
-                    let count = replies.len();
-                    match replies_to {
-                        // Still without waiting. Now that a full queue means
-                        // 64 reads' worth of answers are already pending, it
-                        // really does mean the application has stopped
-                        // reading — and the drain must keep running
-                        // regardless, or the child blocks writing into a full
-                        // output buffer and the harness deadlocks itself.
-                        Some(tx) => {
-                            // Refuse only on the memory bound. The queue is
-                            // unbounded, so this hand-off cannot block and the
-                            // drain cannot stall — which is the constraint
-                            // that rules out backpressuring the reader.
-                            let size = batch.len();
-                            if queued_bytes.load(Ordering::Relaxed) + size > REPLY_QUEUE_BYTES {
-                                shared.mutate(|state| state.replies_dropped += count);
-                            } else {
-                                // Counted as pending *before* the hand-off, so
-                                // a wait that fails while the write is blocked
-                                // can say how many answers are stuck.
-                                pending.fetch_add(count, Ordering::Relaxed);
-                                queued_bytes.fetch_add(size, Ordering::Relaxed);
-                                let request = WriteRequest {
-                                    bytes: batch,
-                                    ack: None, // fire and forget: never wait
-                                    replies: count,
-                                };
-                                if tx.send(request).is_err() {
-                                    pending.fetch_sub(count, Ordering::Relaxed);
-                                    queued_bytes.fetch_sub(size, Ordering::Relaxed);
-                                }
+                }));
+                if let Err(payload) = processing {
+                    // Freeze the last good screen before `touch()` can
+                    // invalidate the cache, so the error carries the grid as
+                    // it stood when the emulator was last coherent.
+                    let frozen = state
+                        .snapshot_cache
+                        .take()
+                        .map_or_else(|| state.build_snapshot(), |(_, screen)| screen);
+                    state.emu_panic = Some(panic_detail(&*payload));
+                    state.snapshot_cache = Some((state.generation, frozen));
+                }
+                state.utf8_pending = utf8_pending;
+                state.touch();
+                replies
+            });
+            // One queue entry per *read*, not per reply. A single read
+            // can carry dozens of queries — a startup batch is a
+            // legitimate pattern — and enqueueing each answer separately
+            // made the reader outrun the writer, which issues one
+            // `write(2)` per entry. The queue then filled and answers
+            // were discarded although nothing was blocked: measured at
+            // 173 of 200 delivered back-to-back, and 200 of 200 with a
+            // millisecond between the queries. Batching is what removes
+            // that mismatch; ordering is unchanged, since the bytes are
+            // concatenated in the order they were built.
+            if !replies.is_empty() {
+                let batch: Vec<u8> = replies.concat();
+                let count = replies.len();
+                match replies_to {
+                    // Still without waiting. Now that a full queue means
+                    // 64 reads' worth of answers are already pending, it
+                    // really does mean the application has stopped
+                    // reading — and the drain must keep running
+                    // regardless, or the child blocks writing into a full
+                    // output buffer and the harness deadlocks itself.
+                    Some(tx) => {
+                        // Refuse only on the memory bound. The queue is
+                        // unbounded, so this hand-off cannot block and the
+                        // drain cannot stall — which is the constraint
+                        // that rules out backpressuring the reader.
+                        let size = batch.len();
+                        if queued_bytes.load(Ordering::Relaxed) + size > REPLY_QUEUE_BYTES {
+                            shared.mutate(|state| state.replies_dropped += count);
+                        } else {
+                            // Counted as pending *before* the hand-off, so
+                            // a wait that fails while the write is blocked
+                            // can say how many answers are stuck.
+                            pending.fetch_add(count, Ordering::Relaxed);
+                            queued_bytes.fetch_add(size, Ordering::Relaxed);
+                            let request = WriteRequest {
+                                bytes: batch,
+                                ack: None, // fire and forget: never wait
+                                replies: count,
+                            };
+                            if tx.send(request).is_err() {
+                                pending.fetch_sub(count, Ordering::Relaxed);
+                                queued_bytes.fetch_sub(size, Ordering::Relaxed);
                             }
                         }
-                        // No responder thread (no descriptor to duplicate):
-                        // write inline, as before.
-                        None => {
-                            let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
-                            if let Some(writer) = writer.as_mut() {
-                                let _ = writer.write_all(&batch).and_then(|()| writer.flush());
-                            }
+                    }
+                    // No responder thread (no descriptor to duplicate):
+                    // write inline, as before.
+                    None => {
+                        let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
+                        if let Some(writer) = writer.as_mut() {
+                            let _ = writer.write_all(&batch).and_then(|()| writer.flush());
                         }
                     }
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            // Linux reports EIO on the master once the child side is gone;
-            // treat any hard error as end-of-stream.
-            Err(_) => break,
+        }
+        if at_eof {
+            break;
         }
     }
     shared.mutate(|state| {
@@ -2245,8 +2438,23 @@ impl Terminal {
         self.write_input(bytes, what)
     }
 
-    /// Click the primary button at `(col, row)` (0-based, like
-    /// [`Screen::cell`]). Sends a press — and, when the application's
+    /// Click the primary button at `(col, row)` — **column first**, 0-based:
+    /// the geometry order of [`TerminalBuilder::size`] and [`Screen::size`],
+    /// and the reverse of the `(row, col)` that [`Screen::find`] and
+    /// [`Screen::cell`] use for cell addresses. The hand-off from a search
+    /// to a click is where the two orders meet, so write the swap out:
+    ///
+    /// ```no_run
+    /// # fn main() -> termlens::Result<()> {
+    /// # let mut t = termlens::Terminal::builder().spawn("true")?;
+    /// let s = t.screen();
+    /// let (row, col) = s.find("MENU").expect("the menu is on screen");
+    /// t.click(col, row)?; // find gives (row, col); click takes (col, row)
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Sends a press — and, when the application's
     /// tracking mode reports them, a release — encoded exactly as the
     /// tracking mode and encoding **the application enabled** (SGR 1006
     /// or the legacy byte form).
@@ -2596,15 +2804,18 @@ impl Terminal {
     ///    correctly. `wait_idle` will not declare idleness while an update
     ///    is open.
     ///
-    /// Applications that emit DEC 2026 synchronized updates need none of
-    /// this — [`wait_frame`](Self::wait_frame) sees only complete frames
-    /// and hands back the one it matched.
-    /// After a [`resize`](Self::resize), also see the stale-frame trap
-    /// documented there.
+    /// Applications that emit DEC 2026 synchronized updates get rule 3 for
+    /// free from [`wait_frame`](Self::wait_frame), which sees only complete
+    /// frames and hands back the one it matched — but not rule 1: a
+    /// predicate true of a frame you did not mean returns that frame
+    /// (`docs/DESIGN.md` §2, rule 4). After a [`resize`](Self::resize),
+    /// also see the stale-frame trap documented there.
     ///
     /// # Errors
     ///
     /// [`Error::Timeout`] / [`Error::Eof`], each carrying the screen.
+    /// [`Error::Emulator`] if the emulation itself failed, in which case the
+    /// grid stopped advancing and no predicate over it means anything.
     pub fn wait_until(&mut self, predicate: impl FnMut(&Screen) -> bool) -> Result<()> {
         self.wait_until_deadline(predicate, self.default_timeout)
     }
@@ -2640,6 +2851,11 @@ impl Terminal {
             }
             seen_generation = Some(state.generation);
 
+            // Before the predicate: a frozen screen can still satisfy one,
+            // and a match on a grid that stopped advancing is not an answer.
+            if let Some(failure) = state.emulator_failure() {
+                return Some(Err(failure));
+            }
             let screen = state.peek_snapshot();
             if predicate(&screen) {
                 return Some(Ok(()));
@@ -2733,6 +2949,28 @@ impl Terminal {
     /// # }
     /// ```
     ///
+    /// A complete frame is not necessarily the frame that answers your
+    /// input. The cursor sits at the last frame *returned*, so after
+    /// `send(key)` a predicate that is also true of the pre-key screen gets
+    /// the pre-key frame, if that one was never returned — rule 4 of
+    /// `docs/DESIGN.md` §2. Name what the key changes:
+    ///
+    /// ```
+    /// # fn main() -> termlens::Result<()> {
+    /// let mut t = termlens::Terminal::builder()
+    ///     .timeout(std::time::Duration::from_secs(10))
+    ///     .args(["-c", r"printf '\033[?2026hcount 1\033[?2026l'; read k; printf '\033[?2026h count 2\033[?2026l'; read quit"])
+    ///     .spawn("sh")?;
+    /// t.wait_until(|s| s.contains("count 1"))?;
+    /// t.send(termlens::Key::Enter)?;                         // the app will paint "count 2"
+    /// let frame = t.wait_frame(|s| s.contains("count"))?;     // true of the pre-key frame too…
+    /// assert!(!frame.contains("count 2"));                    // …and that is the one you get
+    /// let frame = t.wait_frame(|s| s.contains("count 2"))?;   // what the key changed
+    /// assert!(frame.contains("count 2"));
+    /// # t.send(termlens::Key::Enter)?; t.wait_exit()?; Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// [`Error::Timeout`] at the deadline — with a pointed message when the
@@ -2768,6 +3006,9 @@ impl Terminal {
         let cursor = self.frame_cursor;
         let mut seen_frame = None;
         let outcome = self.shared.wait_until(deadline, |state| {
+            if let Some(failure) = state.emulator_failure() {
+                return Some(Err(failure));
+            }
             if state.frames_seen > cursor && seen_frame != Some(state.frames_seen) {
                 seen_frame = Some(state.frames_seen);
                 // Oldest unobserved frame first: several frames can
@@ -2908,11 +3149,20 @@ impl Terminal {
         let deadline = Instant::now() + timeout;
         let mut guard = self.shared.lock();
         loop {
+            // Ahead of the EOF shortcut: a stream that stopped because the
+            // emulator died is not a stream that went quiet.
+            if let Some(failure) = guard.emulator_failure() {
+                return Err(failure);
+            }
             if guard.eof {
                 return Ok(());
             }
             let elapsed = guard.last_activity.elapsed();
-            if elapsed >= quiet && !guard.emu.mid_sequence() && !guard.emu.in_sync_update() {
+            if elapsed >= quiet
+                && !guard.emu.mid_sequence()
+                && !guard.utf8_pending
+                && !guard.emu.in_sync_update()
+            {
                 return Ok(());
             }
 
@@ -3148,9 +3398,9 @@ impl Terminal {
     ///
     /// # Errors
     ///
-    /// [`Error::Size`] if either dimension is zero (a terminal has at least
-    /// one row and one column) or past the 1000-per-axis limit, before the
-    /// PTY or the grid is touched; [`Error::Write`] when the child has
+    /// [`Error::Size`] if either dimension is below 2 or past the
+    /// 1000-per-axis limit, before the PTY or the grid is touched;
+    /// [`Error::Write`] when the child has
     /// released the terminal, carrying the final screen; [`Error::Pty`] if
     /// the ioctl fails.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
@@ -3255,11 +3505,181 @@ impl Drop for Terminal {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
-    use super::{cells_between, check_mouse_in_grid, history_note, Scroll, ScrollChord};
+    use super::{
+        cells_between, check_mouse_in_grid, check_size, history_note, panic_detail, reader_loop,
+        EmuState, Graphics, Monitor, Responder, Scroll, ScrollChord,
+    };
+    use crate::emu::{Emulator, InputModes, ModeState, MouseEncoding, Processed};
     use crate::screen::{Cell, Style, TermState};
     use crate::{Error, Screen};
+
+    /// An emulator that renders one line and then panics, so the reader's
+    /// failure path can be exercised without waiting for a vt100 bug to
+    /// come back (#211).
+    struct PanickingEmulator {
+        reads: usize,
+    }
+
+    impl PanickingEmulator {
+        fn screen() -> Screen {
+            let cells = vec![
+                Cell::new("o".into(), Style::default(), false, false),
+                Cell::new("k".into(), Style::default(), false, false),
+            ];
+            Screen::from_parts(2, 1, 0, 2, true, cells, TermState::default())
+        }
+    }
+
+    impl Emulator for PanickingEmulator {
+        fn process(&mut self, _bytes: &[u8]) -> Processed {
+            // The worst case: it fails on first contact, before any wait has
+            // taken a snapshot of its own. What the error carries then is the
+            // grid the terminal was spawned with, which is still true.
+            self.reads += 1;
+            panic!("attempt to subtract with overflow");
+        }
+        fn snapshot(&self) -> Screen {
+            assert_eq!(
+                self.reads, 0,
+                "the emulator must never be asked for a screen after it panicked"
+            );
+            Self::screen()
+        }
+        fn mid_sequence(&self) -> bool {
+            false
+        }
+        fn in_sync_update(&self) -> bool {
+            false
+        }
+        fn input_modes(&self) -> InputModes {
+            InputModes {
+                mouse: crate::MouseMode::None,
+                mouse_encoding: MouseEncoding::Legacy,
+                bracketed_paste: false,
+                application_cursor: false,
+                focus_events: false,
+            }
+        }
+        fn mode_state(&self, _mode: u32) -> ModeState {
+            ModeState::NotRecognized
+        }
+        fn set_size(&mut self, _rows: u16, _cols: u16) {}
+    }
+
+    fn panicking_state() -> Monitor<EmuState> {
+        Monitor::new(EmuState::new(
+            Box::new(PanickingEmulator { reads: 0 }),
+            Responder {
+                respond: false,
+                background: (0, 0, 0),
+                foreground: (0, 0, 0),
+                cell_size: None,
+                graphics: Graphics::default(),
+                term_name: "xterm-256color".into(),
+            },
+            Arc::new(AtomicUsize::new(0)),
+        ))
+    }
+
+    /// The reader turns an emulator panic into state every wait can report,
+    /// instead of dying and leaving the grid frozen (#211).
+    #[test]
+    fn an_emulator_panic_is_recorded_rather_than_lost() {
+        let shared = panicking_state();
+        let writer: super::SharedWriter = Arc::new(std::sync::Mutex::new(None));
+        let pending = AtomicUsize::new(0);
+        let queued = AtomicUsize::new(0);
+
+        assert!(
+            shared.lock().emulator_failure().is_none(),
+            "healthy to start"
+        );
+
+        // The emulator panics on the first chunk. The reader must catch it,
+        // record it, and still drain to EOF — a reader that stops draining
+        // leaves the child blocked writing into a full buffer.
+        // (A "thread panicked" line on stderr here is the caught panic, and
+        // is expected: the default hook still runs.)
+        reader_loop(
+            Box::new(std::io::Cursor::new(b"first\nsecond\n".to_vec())),
+            &shared,
+            &writer,
+            None,
+            &pending,
+            &queued,
+        );
+
+        let guard = shared.lock();
+        let failure = guard
+            .emulator_failure()
+            .expect("the panic must be recorded, not swallowed");
+        match failure {
+            Error::Emulator { detail, screen } => {
+                assert!(
+                    detail.contains("attempt to subtract with overflow"),
+                    "the emulator's own message belongs in the error: {detail}"
+                );
+                // The frozen screen: the last one taken while the emulator
+                // was still coherent, and `snapshot` is never called again
+                // (PanickingEmulator asserts if it is).
+                assert_eq!(screen.size(), (2, 1));
+                assert_eq!(screen.text().trim_end(), "ok");
+            }
+            other => panic!("expected Error::Emulator, got {other}"),
+        }
+        assert!(
+            guard.eof,
+            "the drain must keep running to EOF after a panic"
+        );
+    }
+
+    #[test]
+    fn a_panic_payload_becomes_the_error_detail() {
+        assert_eq!(panic_detail(&"borrowed"), "borrowed");
+        assert_eq!(panic_detail(&String::from("owned")), "owned");
+        assert_eq!(
+            panic_detail(&7_u32),
+            "the emulator panicked with no message"
+        );
+
+        // Through a real `catch_unwind` payload, which is the only shape
+        // that matters: `&payload` on the returned `Box<dyn Any + Send>`
+        // unsizes to a `&dyn Any` holding the box, and every downcast
+        // misses. This asserts the deref the caller has to write.
+        let literal = super::panic::catch_unwind(|| panic!("static message")).unwrap_err();
+        assert_eq!(panic_detail(&*literal), "static message");
+        let formatted = super::panic::catch_unwind(|| panic!("{} {}", "formatted", 7)).unwrap_err();
+        assert_eq!(panic_detail(&*formatted), "formatted 7");
+    }
+
+    /// One column panics on a wide character and one row panics on a wrap,
+    /// in both profiles, so the floor is two per axis (#211).
+    #[test]
+    fn the_size_floor_is_two_on_both_axes() {
+        for (cols, rows) in [
+            (0, 24),
+            (80, 0),
+            (0, 0),
+            (1, 8),
+            (80, 1),
+            (1, 1),
+            (2, 1),
+            (1, 2),
+        ] {
+            let err = check_size(cols, rows).expect_err(&format!("{cols}x{rows} must be refused"));
+            assert!(matches!(err, Error::Size(_)), "{cols}x{rows}: {err}");
+        }
+        for (cols, rows) in [(2, 2), (2, 8), (80, 24), (1000, 1000)] {
+            assert!(
+                check_size(cols, rows).is_ok(),
+                "{cols}x{rows} must be allowed"
+            );
+        }
+        assert!(check_size(1001, 24).is_err());
+    }
 
     /// The modifier bits ride on the wheel code exactly as on a button.
     #[test]

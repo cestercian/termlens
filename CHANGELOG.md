@@ -9,6 +9,80 @@ listed under a **Changed** or **Removed** heading.
 
 ## [Unreleased]
 
+### Added
+
+- **`Error::Emulator`: an emulator panic is a diagnosis, not a timeout.** The
+  emulation runs on the reader thread, so a panic there propagated nowhere —
+  the drain died, the screen froze, and every wait burned its full deadline
+  reporting a predicate that could never come true. The reader now catches it,
+  records it, and keeps draining (a stalled drain blocks the child writing
+  into a full buffer); `wait_until`, `wait_frame` and `wait_idle` fail at once
+  with the emulator's own message and the last screen taken before the
+  failure. The emulator is never asked for a screen again — after a panic its
+  state means nothing. `wait_exit` is deliberately unaffected: the child's
+  exit status is still true. (#211)
+
+### Changed
+
+- **The smallest terminal is 2x2, not 1x1.** One column panics the emulator on
+  a double-width character, and one row panics it on a line that *wraps* — on
+  the reader thread, in both profiles, where the panic propagates nowhere: the
+  grid froze, every later wait ran to its deadline against a plausible-looking
+  screen, and `cargo test` printed `test result: ok` over a suite that had
+  stopped testing anything. `80x1` is an ordinary shape, not an exotic one.
+  `spawn` and `resize` now refuse a dimension below 2 with `Error::Size`, the
+  way they already refused 0 — #49's "no path can reach the emulator with a
+  zero" was satisfied exactly one value too low. `2x8` and `2x2` render both
+  trigger shapes correctly, so the floor is the smallest guard that closes
+  them. (#211)
+
+- **A child starts in the test process's working directory, not `$HOME`.**
+  Without `current_dir` the PTY layer fell back to the home directory, so a
+  relative `spawn()` path and a directory-sensitive program behaved unlike
+  every other Rust process API — while `current_dir`'s rustdoc promised the
+  test runner's directory all along. The default is now what
+  `std::process::Command` does; `current_dir` still overrides it. A test that
+  relied on the old fallback should say `.current_dir(std::env::home_dir())`
+  explicitly. (#215)
+
+### Fixed
+
+- **`find` no longer matches the blank padding past the end of a row.** Its
+  single-row path searched the row padded out to the terminal width while
+  `contains` searched the trimmed text, so `find("Total: ")` was `Some` on
+  a screen whose row read `Total:` — against the invariant both rustdocs
+  state, that a needle is found precisely when `contains` is true. Both now
+  trim trailing whitespace per row first; the trim treats a drawn trailing
+  U+00A0/U+3000 as padding too, and both rustdocs say so. (#212)
+- **`env_clear()` no longer leaks the machine's login shell.** The PTY layer
+  fills `SHELL` from the host when the variable is absent, so a child's
+  supposedly hermetic environment differed between two machines with
+  different shells. `SHELL=/bin/sh` is now pinned under `env_clear` the way
+  `TERM` is, an explicit `.env("SHELL", …)` still wins, and a test asserts
+  the whole environment rather than probing one name. (#221)
+- **A bare program name under `env_clear()` is refused with the remedies.**
+  Clearing the environment removes `PATH`, so `spawn("sh")` could not
+  resolve and failed with the PTY layer's "Unable to resolve the PATH",
+  which named neither the cause nor a way out. `spawn` now refuses it up
+  front with an `Error::Spawn` that says `env_clear` removed `PATH` and
+  offers both fixes: an absolute path, or `.env("PATH", …)`. (#222)
+- **A byte that is not UTF-8 shows as U+FFFD instead of vanishing.** The
+  backend drops both a byte it cannot decode and the U+FFFD its own parser
+  substitutes for one, so a Latin-1 `é` in a file name left no trace on the
+  grid and every column after it shifted left — a test asserting on the
+  column of what followed passed against the wrong screen. Bytes are now
+  decoded once on the reader thread: an invalid sequence becomes the
+  replacement character a terminal shows (carried through the backend as a
+  noncharacter it will draw, and restored in the snapshot), and a character
+  split across two reads is carried rather than replaced. `wait_idle` treats
+  a stream that stopped mid-character as not yet idle. (#217)
+- **A highlight over CJK or emoji is one span again.** A wide character's
+  continuation column carried no style, so `with_styles()` rendered a bar
+  over `ab汉cd` as two spans with a hole and `cell(row, col).style()` on
+  the second column reported `Default` — DESIGN §3 rule 5 and `find_by`'s
+  rustdoc both promised the opposite. The snapshot now gives the
+  continuation the leading cell's style, as a terminal paints it. (#218)
+
 ## [0.8.0] - 2026-08-29
 
 ### Added
