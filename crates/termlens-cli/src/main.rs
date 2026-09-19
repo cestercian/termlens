@@ -511,20 +511,17 @@ fn take<T>(
     parse(&raw).ok_or_else(|| format!("bad {flag} {raw:?}, expected e.g. {example}"))
 }
 
-/// The text rendering, or with `--ansi` the header over the screen in
-/// colour when stdout is a terminal. A redirect or a pipe is still a
-/// saved screen (#478): `to_ansi` writes C0 controls the snapshot format
-/// refuses, so the non-terminal path writes `with_styles` instead —
-/// colour kept, parseable.
+/// The painted screen when `--ansi` asks for it and stdout is a
+/// terminal; otherwise `with_styles`, the text format with its `styles:`
+/// block. A redirect loses no colour (#454) and writes no C0 the
+/// snapshot format would refuse (#478).
 fn inspect_render(screen: &Screen, ansi: bool) -> String {
     if ansi && io::stdout().is_terminal() {
         let header = screen.to_string();
         let header = header.lines().next().unwrap_or_default();
         format!("{header}\n{}", screen.to_ansi())
-    } else if ansi {
-        screen.with_styles().to_string()
     } else {
-        screen.to_string()
+        screen.with_styles().to_string()
     }
 }
 
