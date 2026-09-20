@@ -36,7 +36,9 @@ reads that marker.
   colour-only change is a difference `diff` names, instead of the plain
   text that made bold red and bold green compare as the same picture
   (#454). `render --text` already wrote the block; the two text
-  renderings now agree.
+  renderings now agree. At a terminal `inspect` prints exactly what it
+  printed before — the block is what a *saved* screen needs, not what a
+  person reading one does, and `is_terminal` tells the two apart.
 
 - `termlens diff --color` with no WHEN after it says `--color needs a WHEN
   argument`, the diagnostic every other flag's missing value gets, instead of

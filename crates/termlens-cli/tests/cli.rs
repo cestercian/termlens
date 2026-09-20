@@ -579,9 +579,14 @@ fn help_and_version() -> termlens::Result<()> {
     let mut t = termlens::bin!("termlens", args(["inspect", "--help"]))?;
     assert_eq!(t.wait_exit()?.code(), Some(0));
     let help = t.screen().to_string();
+    // The help has to say which rendering a redirect gets, or the split
+    // #454 and #478 introduced is undiscoverable: both flags behave one
+    // way at a prompt and another through a pipe. Needles chosen to sit
+    // within one line of the 80-column help, so this pins the claim
+    // rather than the line breaks.
     assert!(
-        help.contains("inspect --ansi") && help.contains("saved screen"),
-        "`inspect --help` must say --ansi still writes a saved screen:\n{help}"
+        help.contains("--ansi") && help.contains("gets a saved screen"),
+        "`inspect --help` must say a redirect gets a saved screen:\n{help}"
     );
     let mut t = termlens::bin!("termlens", args(["--version"]))?;
     assert_eq!(t.wait_exit()?.code(), Some(0));
@@ -786,6 +791,38 @@ fn inspect_ansi_paints_on_a_terminal() -> termlens::Result<()> {
     let cell = s.cell(row, col).expect("the painted cell");
     assert_eq!(cell.style().fg, Color::Indexed(1), "{}", s.with_styles());
     assert!(cell.style().bold, "{}", s.with_styles());
+    Ok(())
+}
+
+/// The other half of #454's split: a terminal is a person looking, so it
+/// gets the plain text it always got. Without this, "a redirect keeps its
+/// styles" collapses into "everything carries a styles block", which is
+/// the noise #454 weighed and did not want at a prompt — and nothing else
+/// here would notice the difference, because every other test in this file
+/// reads `inspect` through a pipe.
+#[test]
+#[cfg_attr(windows, ignore = "the program under inspection is a POSIX shell")]
+fn inspect_on_a_terminal_stays_plain() -> termlens::Result<()> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut t = termlens::bin!(
+        "termlens",
+        env("PATH", &path),
+        args([
+            "inspect",
+            "--size",
+            "30x3",
+            "sh",
+            "-c",
+            r#"printf '\033[1;31mred\033[0m'"#
+        ])
+    )?;
+    assert_eq!(t.wait_exit()?.code(), Some(0), "{}", t.screen());
+    let s = t.screen();
+    assert!(s.contains("red"), "{s}");
+    assert!(
+        !s.contains("styles:"),
+        "a terminal gets what it always got, not a saved screen: {s}"
+    );
     Ok(())
 }
 

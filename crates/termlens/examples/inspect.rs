@@ -88,12 +88,14 @@ fn take<T>(
 /// screen somebody means to read back, so it gets `with_styles` — the
 /// only one of the two text renderings that carries colour (#454, #478).
 fn render(screen: &termlens::Screen, ansi: bool) -> String {
-    if ansi && io::stdout().is_terminal() {
+    if !io::stdout().is_terminal() {
+        screen.with_styles().to_string()
+    } else if ansi {
         let header = screen.to_string();
         let header = header.lines().next().unwrap_or_default();
         format!("{header}\n{}", screen.to_ansi())
     } else {
-        screen.with_styles().to_string()
+        screen.to_string()
     }
 }
 
