@@ -380,22 +380,22 @@ fn arrows_follow_the_apps_cursor_key_mode() -> termlens::Result<()> {
 }
 
 #[test]
-fn clicking_without_mouse_tracking_is_a_typed_error() {
+fn clicking_without_mouse_tracking_is_a_typed_error() -> termlens::Result<()> {
     // hello-tui never enables mouse tracking.
     let mut t = Terminal::builder()
         .size(80, 24)
         .timeout(Duration::from_secs(10))
         .env_clear()
-        .spawn(util::fixture_bin("hello-tui"))
-        .unwrap();
-    t.wait_until(|s| s.contains("╯")).unwrap();
+        .spawn(util::fixture_bin("hello-tui"))?;
+    t.wait_until(|s| s.contains("╯"))?;
 
     let err = t.click(1, 1).unwrap_err();
     assert!(matches!(err, Error::Input(_)), "got: {err}");
     assert!(err.to_string().contains("mouse tracking"), "{err}");
 
-    t.send(Key::Char('q')).unwrap();
-    assert!(t.wait_exit().unwrap().success());
+    t.send(Key::Char('q'))?;
+    assert!(t.wait_exit()?.success());
+    Ok(())
 }
 
 /// A real terminal cannot report a click outside its window. Off-grid
