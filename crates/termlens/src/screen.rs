@@ -1752,6 +1752,21 @@ impl Screen {
     /// With the `regex` feature, `mask_matches` takes a pattern instead; the
     /// two share one engine.
     ///
+    /// # Examples
+    ///
+    /// Mask a clock so a snapshot stops changing on every run. The masked
+    /// time keeps its eight columns, so nothing after it moves:
+    ///
+    /// ```
+    /// use termlens::Screen;
+    ///
+    /// let screen = Screen::parse("size: 20x1  cursor: 0,0\nBuild 12:34:56 ok")?;
+    /// let masked = screen.mask_matching("12:34:56", '#');
+    /// assert_eq!(masked.text(), "Build ######## ok");
+    /// assert_eq!(masked.size(), screen.size());
+    /// # Ok::<(), termlens::Error>(())
+    /// ```
+    ///
     /// # Panics
     ///
     /// If `fill` is not one column wide: a wide fill would change the
